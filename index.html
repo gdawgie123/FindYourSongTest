@@ -385,6 +385,7 @@ function recordArt(key, source, url){
   if(!entry){ entry = artCache[key] = { itunes:null, deezer:null }; }
   // mark this source as attempted even if it returned nothing (empty string)
   entry[source] = url || "";
+  if(source==="itunes"){ entry.itunesFailed = false; }   // settled (found or genuinely absent)
   const best = bestUrl(entry);
   // resolve any first-time waiters with the current best
   if(artWaiters[key]){
@@ -394,6 +395,47 @@ function recordArt(key, source, url){
   // if iTunes just arrived with a real image, tell the UI to upgrade
   if(source==="itunes" && url){ fireArtUpdate(key, url); }
 }
+
+// record a TRANSIENT iTunes failure (timeout / network / rate-limit) so it can
+// be retried later — this is what prevents songs getting permanently stuck on Deezer
+function recordArtFail(key, source){
+  let entry = artCache[key];
+  if(!entry){ entry = artCache[key] = { itunes:null, deezer:null }; }
+  if(source==="itunes"){
+    entry.itunes = entry.itunes || "";   // keep any prior value; still counts as "responded" for waiters
+    entry.itunesFailed = true;           // <-- flag for the retry sweep
+  }
+  // resolve first-time waiters with whatever we have (usually Deezer) so a cover still shows
+  const best = bestUrl(entry);
+  if(artWaiters[key]){
+    artWaiters[key].forEach(fn=>fn(best));
+    delete artWaiters[key];
+  }
+}
+
+// Periodic sweep: find songs whose iTunes lookup failed transiently (not a real
+// "not found") and re-queue them through the MAIN rate-limited queue, so all
+// iTunes traffic flows through a single choke point and can't exceed the limit.
+function sweepItunesRetries(){
+  for(const key in artCache){
+    const e = artCache[key];
+    if(e && e.itunesFailed && !e.itunes){
+      const song = SONGS.find(s=>artKey(s)===key);
+      if(song){
+        e.itunesFailed = false;        // clear so we don't re-queue repeatedly
+        queueItunesRetry(song, key);   // goes through pumpQueue's pacing
+      }
+    }
+  }
+}
+// retry queue drains through the same paced pumpQueue as everything else
+const itunesRetryQueue = [];
+function queueItunesRetry(song, key){
+  if(itunesRetryQueue.some(j=>j.key===key)) return;
+  itunesRetryQueue.push({song, key});
+}
+// run the retry sweep periodically (every ~90s); the actual requests are paced by pumpQueue
+setInterval(()=>{ sweepItunesRetries(); if(typeof pumpQueue==='function') pumpQueue(); }, 90000);
 
 function runLookup(song, key, attempt){
   const cb = "itc_" + (jsonpId++);
@@ -433,13 +475,16 @@ function runLookup(song, key, attempt){
     }
     cleanup();
     if(!url && attempt<2){ runLookup(song, key, attempt+1); return; } // retry with a looser iTunes query
-    recordArt(key, "itunes", url);                                    // record (may be "" = iTunes had nothing)
+    // url found OR genuine "not found" (empty results) -> record as a settled result
+    recordArt(key, "itunes", url);
   };
   function cleanup(){ try{delete window[cb];}catch(e){window[cb]=undefined;} if(script.parentNode) script.parentNode.removeChild(script); }
-  script.onerror=function(){ if(!done){ done=true; cleanup(); if(attempt<2){ runLookup(song,key,attempt+1); } else { recordArt(key,"itunes",""); } } };
+  // network error / blocked / rate-limited: mark as a TRANSIENT failure so it can be retried later
+  script.onerror=function(){ if(!done){ done=true; cleanup(); if(attempt<2){ runLookup(song,key,attempt+1); } else { recordArtFail(key,"itunes"); } } };
   script.src = "https://itunes.apple.com/search?media=music&entity=song&limit=5&callback="+cb+"&term="+encodeURIComponent(term);
   document.body.appendChild(script);
-  setTimeout(()=>{ if(!done){ done=true; cleanup(); if(attempt<2){ runLookup(song,key,attempt+1); } else { recordArt(key,"itunes",""); } } }, 8000);
+  // timeout is also treated as transient (often a rate-limit stall), so it can be retried later
+  setTimeout(()=>{ if(!done){ done=true; cleanup(); if(attempt<2){ runLookup(song,key,attempt+1); } else { recordArtFail(key,"itunes"); } } }, 8000);
 }
 
 /* Deezer fallback — free, no auth, JSONP-friendly. Only runs when iTunes
@@ -1218,6 +1263,12 @@ function nextToFetch(){
     queuedKeys.delete(artKey(s));
     if(!(artKey(s) in artCache)) return s;
   }
+  // iTunes retries (transient failures) — paced through this same queue
+  while(itunesRetryQueue.length){
+    const job = itunesRetryQueue.shift();
+    const e = artCache[job.key];
+    if(e && !e.itunes){ return {__retry:true, song:job.song, key:job.key}; }
+  }
   // hold off the background sweep briefly while the user scrolls / views a song
   if(Date.now() < interactingUntil) return null;
   while(bgIdx < SONGS.length){
@@ -1241,9 +1292,17 @@ function pumpQueue(){
   const done = ()=>{ if(settled) return; settled=true; inFlight=false; pumpQueue(); };
   setTimeout(()=>{
     lastCall = Date.now();
-    fetchArt(song).then(done).catch(done);
-    // hard safety net: never let a single lookup freeze the queue for >12s
-    setTimeout(done, 12000);
+    if(song.__retry){
+      // iTunes-only retry (Deezer already resolved); resolves via recordArt/recordArtFail
+      const before = artCache[song.key] ? artCache[song.key].itunes : null;
+      runLookup(song.song, song.key, 0);
+      // we can't await runLookup directly; give it the standard window then continue
+      setTimeout(done, 9000);
+    } else {
+      fetchArt(song).then(done).catch(done);
+      // hard safety net: never let a single lookup freeze the queue for >12s
+      setTimeout(done, 12000);
+    }
   }, wait);
 }
 
